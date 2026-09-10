@@ -17,8 +17,8 @@
 import type { SubtitleItem } from '../types';
 import { callPortChat } from './portGateway';
 import { callDirectChat, isDirectApiModel } from './directApiService';
-import { callClaudeLocalChat, isClaudeLocalModel } from './claudeLocalService';
-import { callClaudeSv2Chat, isClaudeSv2Model } from './claudeSv2Service';
+import { callCursorSv3Chat, isCursorSv3Model } from './cursorSv3Service';
+import { callGeminiSv4Chat, isGeminiSv4Model } from './geminiSv4Service';
 import { throwIfAborted } from '../utils/stopControl';
 import { withRetry } from '../utils/retry';
 import { lamSachMoTa } from '../utils/promptSanitizer';
@@ -73,8 +73,8 @@ const callByModel = async (
     model: string, systemText: string, userText: string, signal?: AbortSignal
 ): Promise<ChatResult> => {
     const opts = { model, systemText, userText, temperature: 0.7, json: true, signal };
-    if (isClaudeSv2Model(model)) return callClaudeSv2Chat(opts);
-    if (isClaudeLocalModel(model)) return callClaudeLocalChat(opts);
+    if (isGeminiSv4Model(model)) return callGeminiSv4Chat(opts);
+    if (isCursorSv3Model(model)) return callCursorSv3Chat(opts);
     if (isDirectApiModel(model)) return callDirectChat(opts);
     return callPortChat(opts);
 };

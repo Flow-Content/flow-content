@@ -50,7 +50,7 @@ import UpdateButton from './components/UpdateButton';
 import EndpointSettingsModal from './components/EndpointSettingsModal';
 
 const IMAGE_TAB_LOCKED = false;
-const APP_VERSION = '3.10.2';
+const APP_VERSION = '3.10.3';
 
 /**
  * Điều hướng 2 cấp: nhóm tab tổng → tab con.
@@ -1169,8 +1169,7 @@ const App: React.FC = () => {
                 // Lô theo nhà cung cấp: DeepSeek 10 (lô to cụt JSON), Vilao 50 (mỗi request
                 // cõng ~45K token ngữ cảnh ẩn → lô to mới rẻ), Claude SV1/SV2 25 (lô 50 phải
                 // viết ~10K token một hơi → chậm + dễ trả thiếu dòng), Gemini cổng/Vertex 50 như cũ
-                const CHUNK_SIZE = getDirectApiChunkSize(promptTextModel)
-                    ?? (promptTextModel.startsWith('claude-') ? 25 : 50);
+                const CHUNK_SIZE = getDirectApiChunkSize(promptTextModel) ?? 50;
                 // Lô cắt thêm tại MỐC BIẾN ĐỔI nhân vật — cả lô dùng chung một roster mã @
                 // (không có mốc/không nhân vật giai đoạn → y hệt cách chia cũ).
                 const chunks: SubtitleItem[][] = chunkByStage(pendingItems, CHUNK_SIZE, activeEdoChars);
@@ -1184,9 +1183,7 @@ const App: React.FC = () => {
 
                 // CHẠY SONG SONG như tab Prompts Veo3 (mỗi dòng độc lập, nhân vật đã chốt
                 // 1 lần phát chung → an toàn): SV2/Gemini 4 luồng, SV1/DeepSeek 3 luồng.
-                const PROMPT_CONC = promptTextModel.endsWith('-max') ? 4
-                    : promptTextModel.startsWith('claude-') ? 3
-                    : promptTextModel.startsWith('deepseek') ? 3 : 4;
+                const PROMPT_CONC = promptTextModel.startsWith('deepseek') ? 3 : 4;
                 let doneChunks = 0;
                 let failedChunks = 0;
 
