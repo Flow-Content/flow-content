@@ -36,6 +36,7 @@ import TongTaiPanel from './components/TongTaiPanel';
 import UkiyoePanel from './components/UkiyoePanel';
 import JoseonPanel from './components/JoseonPanel';
 import EdoPanel from './components/EdoPanel';
+import IsekaiPromptPanel from './components/IsekaiPromptPanel';
 import {
     EDO_CHAR_STYLE,
     EdoCharacter,
@@ -50,13 +51,13 @@ import UpdateButton from './components/UpdateButton';
 import EndpointSettingsModal from './components/EndpointSettingsModal';
 
 const IMAGE_TAB_LOCKED = false;
-const APP_VERSION = '3.10.3';
+const APP_VERSION = '3.10.4';
 
 /**
  * Điều hướng 2 cấp: nhóm tab tổng → tab con.
  * Bấm nhóm là nhảy vào tab con đầu tiên; nhóm 1 tab thì ẩn hàng tab con.
  */
-type TabId = 'prompt' | 'prompt2' | 'image' | 'batch-image' | 'veo3-prompt' | 'veo3' | 'tts-gemini' | 'camp-content'
+type TabId = 'prompt' | 'isekai-prompt' | 'prompt2' | 'image' | 'batch-image' | 'veo3-prompt' | 'veo3' | 'tts-gemini' | 'camp-content'
     | 'localization' | 'reverse-thinking' | 'fresh-rewrite' | 'manhwa' | 'veo3-prompts' | 'tong-tai' | 'ukiyoe' | 'joseon' | 'edo-at';
 
 const TAB_GROUPS: {
@@ -67,6 +68,7 @@ const TAB_GROUPS: {
         id: 'image', label: 'Prompts Ảnh', icon: 'fa-images', color: 'bg-blue-600',
         tabs: [
             { id: 'prompt', label: 'Prompts 1', icon: 'fa-paragraph', hint: 'có nhân vật' },
+            { id: 'isekai-prompt', label: 'Isekai', icon: 'fa-khanda', hint: 'dị giới · 1 dòng 1 ảnh' },
             { id: 'prompt2', label: 'Prompts 2', icon: 'fa-landmark', hint: 'không nhân vật' },
         ],
     },
@@ -354,6 +356,23 @@ const App: React.FC = () => {
             return newTotal;
         });
     };
+
+    const addIsekaiPromptCount = useCallback((promptCount: number) => {
+        setSessionTokenUsed(prev => prev + promptCount);
+        setUserTokenUsed(prev => {
+            const newTotal = prev + promptCount;
+            localStorage.setItem('userTokenUsed', newTotal.toString());
+            if (currentUser) {
+                localStorage.setItem(`${currentUser}_tokenUsed`, newTotal.toString());
+            }
+            return newTotal;
+        });
+    }, [currentUser]);
+
+    const handleIsekaiTransferCharacterJobs = useCallback((jobs: ImageJob[]) => {
+        setCharacterJobs(prev => [...prev, ...jobs]);
+        setActiveTab('image');
+    }, []);
 
     const addVeo3Usage = (usage: TokenUsage, promptCount: number = 0) => {
         setVeo3TokenUsage(prev => ({
@@ -2177,6 +2196,13 @@ const App: React.FC = () => {
                             <ResultsTable results={results} isLoading={isLoading} />
                         </div>
                     </main>
+                </div>
+
+                <div className={activeTab === 'isekai-prompt' ? 'block animate-fade-in' : 'hidden'}>
+                    <IsekaiPromptPanel
+                        onUsage={addIsekaiPromptCount}
+                        onTransferCharacterJobs={handleIsekaiTransferCharacterJobs}
+                    />
                 </div>
 
                 {/* PROMPT GENERATOR 2 VIEW */}
