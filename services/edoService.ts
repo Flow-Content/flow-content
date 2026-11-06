@@ -16,8 +16,10 @@ import { callPortChat } from './portGateway';
 import { callDirectChat, isDirectApiModel } from './directApiService';
 import { callCursorSv3Chat, isCursorSv3Model } from './cursorSv3Service';
 import { callGeminiSv4Chat, isGeminiSv4Model } from './geminiSv4Service';
-import { throwIfAborted } from '../utils/stopControl';
-import { withRetry } from '../utils/retry';
+import { isStopError, throwIfAborted } from '../utils/stopControl';
+import { ModelJsonError, parseModelJson } from '../utils/jsonRepair';
+import { LLM_JSON_MAX_TOKENS } from '../utils/llmOutputBudget';
+import { withTransientRetries } from '../utils/llmRetry';
 import { UKIYOE_DEFAULT_STYLE } from './ukiyoeService';
 import { VEO_AUDIO_LOCK, styleDaChanAudio } from './joseonService';
 import { lamSachMoTa } from '../utils/promptSanitizer';
@@ -89,18 +91,14 @@ interface ChatResult { text: string; usage: { inputTokens: number; outputTokens:
 const callByModel = async (
     model: string, systemText: string, userText: string, signal?: AbortSignal
 ): Promise<ChatResult> => {
-    const opts = { model, systemText, userText, temperature: 0.7, json: true, signal };
+    const opts = { model, systemText, userText, temperature: 0.7, json: true, signal, maxTokens: LLM_JSON_MAX_TOKENS };
     if (isGeminiSv4Model(model)) return callGeminiSv4Chat(opts);
     if (isCursorSv3Model(model)) return callCursorSv3Chat(opts);
     if (isDirectApiModel(model)) return callDirectChat(opts);
     return callPortChat(opts);
 };
 
-const cleanJson = (raw: string): any => {
-    let s = raw.trim();
-    s = s.replace(/^```json\s*/i, '').replace(/^```\s*/, '').replace(/\s*```$/, '');
-    return JSON.parse(s.trim());
-};
+const cleanJson = (raw: string): any => parseModelJson(raw);
 
 /** Mã @ chỉ được có chữ/số/gạch dưới — Veo hay nuốt ký tự lạ trong tên. */
 const chuanHoaMa = (raw: string, fallback: string): string => {
@@ -124,6 +122,212 @@ export const tomTatTaiDong = (c: EdoCharacter, cueId: number): string => {
     return out;
 };
 
+/** Trần ký tự khi gửi kịch bản đi phân tích. 350 cue thoại thường nằm dưới mức này → gửi hết. */
+export const EDO_ANALYSIS_CHAR_BUDGET = 100_000;
+
+/**
+ * Chọn dòng đưa vào phân tích. Vừa túi thì trả CẢ file (không bước 2 bỏ nửa).
+ * Quá trần thì phủ đầu, giữa, cuối — ưu tiên đoạn cuối để không mất nhân vật xuất hiện muộn.
+ */
+export const selectEdoAnalysisItems = <T extends { id: number; text: string }>(
+    items: T[],
+    maxChars: number = EDO_ANALYSIS_CHAR_BUDGET,
+): T[] => {
+    if (!items.length) return [];
+    const lineCost = items.map(it => `${it.id}. ${it.text}`.length + 1);
+    const total = lineCost.reduce((sum, n) => sum + n, 0);
+    if (total <= maxChars) return items.slice();
+
+    const n = items.length;
+    const headN = Math.max(1, Math.round(n * 0.2));
+    const midN = Math.max(1, Math.round(n * 0.2));
+    const tailN = Math.max(1, Math.round(n * 0.25));
+    const midStart = Math.max(0, Math.floor((n - midN) / 2));
+    const range = (from: number, count: number): number[] => {
+        const out: number[] = [];
+        for (let i = Math.max(0, from); i < Math.min(n, from + count); i++) out.push(i);
+        return out;
+    };
+    const tailDesc: number[] = [];
+    for (let i = n - 1; i >= Math.max(0, n - tailN); i--) tailDesc.push(i);
+    const stride = Math.max(1, Math.ceil(n / 200));
+    const strideIdx: number[] = [];
+    for (let i = 0; i < n; i += stride) strideIdx.push(i);
+    const anchors = [0, Math.min(n - 1, Math.floor(n / 2)), n - 1];
+    const groups = [anchors, tailDesc, range(0, headN), range(midStart, midN), strideIdx];
+
+    const chosen: number[] = [];
+    const seen = new Set<number>();
+    let cost = 0;
+    for (const group of groups) {
+        for (const idx of group) {
+            if (seen.has(idx) || idx < 0 || idx >= n) continue;
+            const c = lineCost[idx];
+            if (cost + c > maxChars) continue;
+            seen.add(idx);
+            chosen.push(idx);
+            cost += c;
+        }
+    }
+    if (!chosen.length) {
+        for (const idx of anchors) {
+            if (cost + lineCost[idx] > maxChars && chosen.length) break;
+            chosen.push(idx);
+            cost += lineCost[idx];
+        }
+    }
+    return chosen.sort((a, b) => a - b).map(i => items[i]);
+};
+
+const normSheetMa = (raw: string): string =>
+    String(raw || '').trim().replace(/^@+/, '').toLowerCase();
+
+export interface SheetAlignResult {
+    byMa: Map<string, string>;
+    missing: string[];
+    realigned: { from: string; to: string }[];
+}
+
+/** Khớp prompt tạo hình theo mã. Mã lệch nhẹ thì gắn theo thứ tự phần còn lại. */
+export const alignSheetPrompts = (
+    batch: { ma: string }[],
+    returned: { ma?: string; prompt?: string }[],
+): SheetAlignResult => {
+    const byMa = new Map<string, string>();
+    const used = new Set<number>();
+    const realigned: { from: string; to: string }[] = [];
+    returned.forEach((r, i) => {
+        const prompt = String(r?.prompt || '').trim();
+        if (!prompt) return;
+        const idx = batch.findIndex(b => !byMa.has(b.ma) && normSheetMa(String(r?.ma || '')) === normSheetMa(b.ma));
+        if (idx >= 0) {
+            used.add(i);
+            byMa.set(batch[idx].ma, prompt);
+        }
+    });
+    const missingBatch = batch.filter(b => !byMa.has(b.ma));
+    const leftover = returned
+        .map((r, i) => ({ r, i }))
+        .filter(x => !used.has(x.i) && String(x.r?.prompt || '').trim());
+    const n = Math.min(missingBatch.length, leftover.length);
+    for (let i = 0; i < n; i++) {
+        const prompt = String(leftover[i].r.prompt || '').trim();
+        byMa.set(missingBatch[i].ma, prompt);
+        const from = String(leftover[i].r.ma || '');
+        if (normSheetMa(from) !== normSheetMa(missingBatch[i].ma)) {
+            realigned.push({ from, to: missingBatch[i].ma });
+        }
+    }
+    return {
+        byMa,
+        missing: batch.filter(b => !byMa.has(b.ma)).map(b => b.ma),
+        realigned,
+    };
+};
+
+const charactersFromAnalysisJson = (data: any): EdoCharacter[] => {
+    const daDung = new Set<string>();
+    return (Array.isArray(data?.characters) ? data.characters : [])
+        .map((c: any, ci: number) => {
+            const ten = String(c.ten || '').trim() || `Nhanvat${ci + 1}`;
+            const laNhom = !!c.laNhom;
+            const stages: EdoStage[] = (Array.isArray(c.giaiDoan) ? c.giaiDoan : [])
+                .map((g: any, gi: number) => {
+                    const raw = laNhom ? '' : String(g.ma || '').trim();
+                    let ma = '';
+                    if (raw) {
+                        ma = chuanHoaMa(raw, `Nhanvat${ci + 1}_${gi + 1}`);
+                        while (daDung.has(ma.toLowerCase())) ma = `${ma}_${gi + 1}`;
+                        daDung.add(ma.toLowerCase());
+                    }
+                    return {
+                        tuDong: Math.max(1, Number(g.tuDong) || 1),
+                        moc: String(g.moc || '').trim(),
+                        ma,
+                        tomTat: lamSachMoTa(String(g.tomTat || '').trim()),
+                        promptTaoHinh: '',
+                    };
+                })
+                .sort((a: EdoStage, b: EdoStage) => a.tuDong - b.tuDong);
+            return {
+                ten,
+                vai: String(c.vai || '').trim(),
+                laNhom,
+                faceDna: laNhom ? '' : lamSachMoTa(String(c.faceDna || '').trim()),
+                giaiDoan: stages,
+            };
+        })
+        .filter((c: EdoCharacter) => c.giaiDoan.length > 0);
+};
+
+/** Gộp các lô phân tích. Nhân vật chỉ có ở nửa sau vẫn được giữ. */
+export const mergeEdoCharacters = (lists: EdoCharacter[][]): EdoCharacter[] => {
+    const byName = new Map<string, EdoCharacter>();
+    const usedMa = new Set<string>();
+    const claim = (raw: string): string => {
+        let ma = raw;
+        const base = ma;
+        let n = 2;
+        while (usedMa.has(ma.toLowerCase())) {
+            ma = `${base}_${n}`;
+            n++;
+        }
+        usedMa.add(ma.toLowerCase());
+        return ma;
+    };
+    for (const list of lists) {
+        for (const c of list) {
+            const key = c.ten.trim().toLowerCase() || `noname-${byName.size}`;
+            const prev = byName.get(key);
+            if (!prev) {
+                byName.set(key, {
+                    ...c,
+                    giaiDoan: c.giaiDoan.map(g => ({ ...g, ma: g.ma ? claim(g.ma) : '', promptTaoHinh: '' })),
+                });
+                continue;
+            }
+            if (!prev.faceDna && c.faceDna) prev.faceDna = c.faceDna;
+            if (!prev.vai && c.vai) prev.vai = c.vai;
+            if (prev.laNhom && !c.laNhom) prev.laNhom = false;
+            for (const g of c.giaiDoan) {
+                if (g.ma && prev.giaiDoan.some(x => x.ma.toLowerCase() === g.ma.toLowerCase())) continue;
+                prev.giaiDoan.push({ ...g, ma: g.ma ? claim(g.ma) : '', promptTaoHinh: '' });
+            }
+            prev.giaiDoan.sort((a, b) => a.tuDong - b.tuDong);
+        }
+    }
+    return [...byName.values()].filter(c => c.giaiDoan.length > 0);
+};
+
+/** Phân tích cũ (không giai đoạn) → dàn tối thiểu để vẫn viết được sheet tạo hình. */
+export const legacyProfilesToEdoCharacters = (
+    profiles: { name: string; description: string }[],
+): EdoCharacter[] => {
+    const used = new Set<string>();
+    return profiles
+        .map((p, i) => {
+            const ten = String(p.name || '').trim() || `Nhanvat${i + 1}`;
+            let ma = chuanHoaMa(ten, `Nhanvat${i + 1}`);
+            while (used.has(ma.toLowerCase())) ma = `${ma}_${i + 1}`;
+            used.add(ma.toLowerCase());
+            const look = lamSachMoTa(String(p.description || '').trim());
+            return {
+                ten,
+                vai: 'nhân vật',
+                laNhom: false,
+                faceDna: look,
+                giaiDoan: [{
+                    tuDong: 1,
+                    moc: 'phân tích cũ',
+                    ma,
+                    tomTat: look,
+                    promptTaoHinh: '',
+                }],
+            };
+        })
+        .filter(c => c.giaiDoan.length > 0 && !!c.giaiDoan[0].ma);
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // PHA 1 — TÁCH NHÂN VẬT, CHỐT FACE DNA & CÁC GIAI ĐOẠN (1 lượt đọc toàn truyện)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -131,14 +335,15 @@ export const analyzeEdoCharacters = async (args: {
     items: SubtitleItem[];
     model: string;
     signal?: AbortSignal;
+    /** Ghi chú cho UI (tab Prompts ảnh). Không đổi luồng tách lô. */
+    onNote?: (message: string) => void;
 }): Promise<EdoCharacter[]> => {
-    const { items, model, signal } = args;
+    const { items, model, signal, onNote } = args;
+    const note = (message: string) => {
+        console.warn(message);
+        onNote?.(message);
+    };
     throwIfAborted(signal);
-
-    // Truyện dài: lấy mẫu đều toàn bộ để thấy cả biến đổi cuối truyện.
-    const MAX = 320;
-    const step = Math.max(1, Math.ceil(items.length / MAX));
-    const sample = items.filter((_, i) => i % step === 0).map(it => `${it.id}. ${it.text}`).join('\n');
 
     const systemText = `ROLE: Bạn là đạo diễn casting cho phim hoạt hình 2D truyện cổ dân gian Nhật Bản (昔話) thời Edo.
 
@@ -179,53 +384,76 @@ ${EDO_COSTUME_RULES}
 
 OUTPUT CHỈ JSON, không lời dẫn:
 {"characters":[{"ten":"Tên (phiên âm)","vai":"vai trò ngắn","laNhom":false,"faceDna":"...","giaiDoan":[{"tuDong":1,"moc":"ban đầu","ma":"Ten_chang","tomTat":"..."}]}]}
-JSON SAFETY: TUYỆT ĐỐI không dùng dấu nháy kép (") bên trong giá trị chuỗi.`;
+JSON SAFETY: TUYỆT ĐỐI không dùng dấu nháy kép (") bên trong giá trị chuỗi. Thoại trong 「」 không được chép kèm dấu " — diễn tả bằng hành động, ánh mắt, nét mặt.`;
 
-    const res = await withRetry(
-        () => callByModel(model, systemText, sample, signal),
-        3, undefined, signal
-    );
-    const data = cleanJson(res.text);
-    const daDung = new Set<string>();
+    const requestCharacters = async (text: string): Promise<EdoCharacter[]> => {
+        const res = await withTransientRetries(
+            () => callByModel(model, systemText, text, signal),
+            { attempts: 3, signal },
+        );
+        let data: any;
+        try {
+            data = cleanJson(res.text);
+        } catch (e) {
+            throw new ModelJsonError(e instanceof Error ? e.message : String(e));
+        }
+        const list = charactersFromAnalysisJson(data);
+        if (!list.length) throw new ModelJsonError('Không phân tích được nhân vật (JSON rỗng).');
+        return list;
+    };
 
-    const list: EdoCharacter[] = (Array.isArray(data?.characters) ? data.characters : [])
-        .map((c: any, ci: number) => {
-            const ten = String(c.ten || '').trim() || `Nhanvat${ci + 1}`;
-            // Nhóm người KHÔNG vẽ ảnh — ép rỗng ở đây phòng khi AI vẫn trả mã.
-            const laNhom = !!c.laNhom;
-            const stages: EdoStage[] = (Array.isArray(c.giaiDoan) ? c.giaiDoan : [])
-                .map((g: any, gi: number) => {
-                    // Mã rỗng = giai đoạn KHÔNG vẽ ảnh (sơ sinh, nhóm người) → tả generic trong cảnh.
-                    // Còn lại: mã phải sạch và DUY NHẤT — trùng mã là hai người dùng chung một ảnh.
-                    const raw = laNhom ? '' : String(g.ma || '').trim();
-                    let ma = '';
-                    if (raw) {
-                        ma = chuanHoaMa(raw, `Nhanvat${ci + 1}_${gi + 1}`);
-                        while (daDung.has(ma.toLowerCase())) ma = `${ma}_${gi + 1}`;
-                        daDung.add(ma.toLowerCase());
-                    }
-                    return {
-                        tuDong: Math.max(1, Number(g.tuDong) || 1),
-                        moc: String(g.moc || '').trim(),
-                        ma,
-                        // Lọc tầng code — model hay lách blacklist (scar/ragged/bloodshot…).
-                        tomTat: lamSachMoTa(String(g.tomTat || '').trim()),
-                        promptTaoHinh: '',
-                    };
-                })
-                .sort((a: EdoStage, b: EdoStage) => a.tuDong - b.tuDong);
-            return {
-                ten,
-                vai: String(c.vai || '').trim(),
-                laNhom,
-                faceDna: laNhom ? '' : lamSachMoTa(String(c.faceDna || '').trim()),
-                giaiDoan: stages,
-            };
-        })
-        .filter((c: EdoCharacter) => c.giaiDoan.length > 0);
+    const shouldSplit = (e: unknown, length: number): boolean => {
+        if (length <= 1) return false;
+        if (e instanceof ModelJsonError) {
+            if (e.message.includes('rỗng') && length <= 40) return false;
+            return true;
+        }
+        const m = (e instanceof Error ? e.message : String(e)).toLowerCase();
+        return /too long|context length|maximum context|payload too|request entity|413|too many tokens|token limit|max(?:imum)? tokens/.test(m);
+    };
 
-    if (!list.length) throw new Error('Không phân tích được nhân vật (JSON rỗng).');
-    return list;
+    const analyzeSlice = async (slice: SubtitleItem[]): Promise<EdoCharacter[]> => {
+        throwIfAborted(signal);
+        if (!slice.length) return [];
+        const selected = selectEdoAnalysisItems(slice);
+        if (selected.length !== slice.length) {
+            note(`[Edo] Kịch bản dài — mẫu ${selected.length}/${slice.length} dòng, phủ đầu–giữa–cuối (dòng ${selected[0].id} → ${selected[selected.length - 1].id}).`);
+        }
+        const text = selected.map(it => `${it.id}. ${it.text}`).join('\n');
+        try {
+            return await requestCharacters(text);
+        } catch (e) {
+            if (isStopError(e) || signal?.aborted) throw e;
+            if (e instanceof ModelJsonError && e.message.includes('rỗng') && slice.length <= 40) return [];
+            if (!shouldSplit(e, slice.length)) throw e;
+            const mid = Math.ceil(slice.length / 2);
+            const detail = e instanceof Error ? e.message : String(e);
+            note(`[Edo] JSON phân tích hỏng (${slice.length} dòng) — tách đôi và thử lại. Nguyên nhân: ${detail}`);
+            const parts = [slice.slice(0, mid), slice.slice(mid)];
+            const ok: EdoCharacter[][] = [];
+            const errors: unknown[] = [];
+            for (const part of parts) {
+                try {
+                    ok.push(await analyzeSlice(part));
+                } catch (err) {
+                    if (isStopError(err) || signal?.aborted) throw err;
+                    errors.push(err);
+                }
+            }
+            const merged = mergeEdoCharacters(ok);
+            if (!merged.length) {
+                const first = errors[0];
+                throw first instanceof Error ? first : (e instanceof Error ? e : new Error('Không phân tích được nhân vật sau khi tách lô.'));
+            }
+            if (errors.length) {
+                const detail = errors.map(err => (err instanceof Error ? err.message : String(err))).join(' | ');
+                note(`[Edo] Giữ ${merged.length} nhân vật từ phần đọc được; ${errors.length} phần vẫn lỗi: ${detail}`);
+            }
+            return merged;
+        }
+    };
+
+    return analyzeSlice(items);
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -241,8 +469,14 @@ export const generateEdoCharacterSheets = async (args: {
     customInstructions: string;
     signal?: AbortSignal;
     onProgress?: (done: number, total: number) => void;
+    /** Ghi chú cho UI (tab Prompts ảnh). Không đổi luồng tách lô / promptTaoHinh. */
+    onNote?: (message: string) => void;
 }): Promise<EdoCharacter[]> => {
-    const { characters, model, charStyle, customInstructions, signal, onProgress } = args;
+    const { characters, model, charStyle, customInstructions, signal, onProgress, onNote } = args;
+    const note = (message: string) => {
+        console.warn(message);
+        onNote?.(message);
+    };
     throwIfAborted(signal);
 
     // Chỉ vẽ giai đoạn CÓ MÃ — chặng sơ sinh và nhóm người mã rỗng nên tự loại.
@@ -293,24 +527,79 @@ ${customInstructions ? `\n════════ YÊU CẦU THÊM CỦA NGƯ�
 
 OUTPUT CHỈ JSON: {"items":[{"ma":"<mã đầu vào>","prompt":"<prompt tiếng Anh>"}]}
 Số phần tử BẰNG ĐÚNG số mục đầu vào, đúng thứ tự.
-JSON SAFETY: TUYỆT ĐỐI không dùng dấu nháy kép (") bên trong prompt.`;
+JSON SAFETY: TUYỆT ĐỐI không dùng dấu nháy kép (") bên trong prompt. Thoại trong 「」 không được chép kèm dấu " — diễn tả bằng hành động, ánh mắt, nét mặt.`;
+
+    const fillSheetBatch = async (
+        batch: typeof flat,
+    ): Promise<Map<string, string>> => {
+        throwIfAborted(signal);
+        const out = new Map<string, string>();
+        if (!batch.length) return out;
+        const attempts = batch.length === 1 ? 2 : 1;
+        let aligned: SheetAlignResult | null = null;
+        let lastErr = '';
+        for (let attempt = 1; attempt <= attempts; attempt++) {
+            try {
+                const res = await withTransientRetries(
+                    () => callByModel(model, systemText, JSON.stringify(batch), signal),
+                    { attempts: 3, signal },
+                );
+                let data: any;
+                try {
+                    data = cleanJson(res.text);
+                } catch (e) {
+                    throw new ModelJsonError(e instanceof Error ? e.message : String(e));
+                }
+                const items: { ma?: string; prompt?: string }[] = Array.isArray(data?.items) ? data.items : [];
+                aligned = alignSheetPrompts(batch, items);
+                break;
+            } catch (e) {
+                if (isStopError(e) || signal?.aborted) throw e;
+                lastErr = e instanceof Error ? e.message : String(e);
+                aligned = null;
+                if (batch.length > 1) break;
+            }
+        }
+        if (aligned) {
+            for (const row of aligned.realigned) {
+                note(`[Edo tạo hình] mã "${row.from}" lệch — gắn theo thứ tự cho ${row.to}`);
+            }
+            for (const [ma, prompt] of aligned.byMa) out.set(ma, prompt);
+            const missingBatch = batch.filter(b => !out.has(b.ma));
+            if (!missingBatch.length) return out;
+            if (missingBatch.length < batch.length) {
+                const more = await fillSheetBatch(missingBatch);
+                for (const [ma, prompt] of more) out.set(ma, prompt);
+                return out;
+            }
+        }
+        if (batch.length <= 1) {
+            note(`[Edo tạo hình] giai đoạn ${batch[0].ma} không có prompt sau mọi lần thử${lastErr ? `: ${lastErr}` : ''}.`);
+            return out;
+        }
+        const mid = Math.ceil(batch.length / 2);
+        const why = lastErr || (aligned ? `lệch số hoặc prompt rỗng (${aligned.missing.length}/${batch.length})` : 'JSON hỏng');
+        note(`[Edo tạo hình] lô ${batch.length} giai đoạn thiếu prompt hoặc JSON hỏng — tách đôi. Nguyên nhân: ${why}`);
+        const left = await fillSheetBatch(batch.slice(0, mid));
+        const right = await fillSheetBatch(batch.slice(mid));
+        for (const [ma, prompt] of left) out.set(ma, prompt);
+        for (const [ma, prompt] of right) out.set(ma, prompt);
+        return out;
+    };
 
     const promptByMa = new Map<string, string>();
     let done = 0;
     for (const batch of batches) {
         throwIfAborted(signal);
-        const res = await withRetry(
-            () => callByModel(model, systemText, JSON.stringify(batch), signal),
-            3, undefined, signal
-        );
-        const data = cleanJson(res.text);
-        const items: { ma: string; prompt: string }[] = Array.isArray(data?.items) ? data.items : [];
-        if (items.length !== batch.length) {
-            throw new Error(`Lô tạo hình trả về ${items.length}/${batch.length} prompt — thử lại.`);
-        }
-        for (const it of items) promptByMa.set(String(it.ma), String(it.prompt || '').trim());
+        const got = await fillSheetBatch(batch);
+        for (const [ma, prompt] of got) promptByMa.set(ma, prompt);
         done += batch.length;
         onProgress?.(done, flat.length);
+    }
+    const missingMa = flat.filter(g => !promptByMa.get(g.ma)).map(g => g.ma);
+    if (missingMa.length) {
+        console.warn(`[Edo tạo hình] ${missingMa.length} giai đoạn không có prompt sau mọi lần thử: ${missingMa.join(', ')}`);
+        onNote?.(`[Edo tạo hình] ${missingMa.length} giai đoạn không có prompt sau mọi lần thử: ${missingMa.join(', ')}`);
     }
 
     // Hậu tố style do CODE nối — nguyên văn 100%, AI khỏi viết lại từng ảnh.

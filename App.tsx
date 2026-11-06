@@ -40,18 +40,24 @@ import IsekaiPromptPanel from './components/IsekaiPromptPanel';
 import {
     EDO_CHAR_STYLE,
     EdoCharacter,
-    analyzeEdoCharacters,
-    generateEdoCharacterSheets,
     maTaiDong,
     tomTatTaiDong,
 } from './services/edoService';
+import { resolveImageTabCast } from './services/imageCast';
+import {
+    formatPromptLineError,
+    imagePromptChunkSize,
+    isUsableImagePrompt,
+    recoverPromptBatch,
+} from './utils/promptBatchRecovery';
+import { withTransientRetries } from './utils/llmRetry';
 import TTSGeminiPanel from './components/TTSGeminiPanel';
 import CampContentPanel from './components/CampContentPanel';
 import UpdateButton from './components/UpdateButton';
 import EndpointSettingsModal from './components/EndpointSettingsModal';
 
 const IMAGE_TAB_LOCKED = false;
-const APP_VERSION = '3.10.4';
+const APP_VERSION = '3.10.5';
 
 /**
  * Điều hướng 2 cấp: nhóm tab tổng → tab con.
@@ -146,6 +152,23 @@ const chunkByStage = <T extends { id: number }>(items: T[], chunkSize: number, c
 };
 
 /** 2 sheet Excel "Tạo hình" + "Nhân vật" — cột y hệt tab 4. Edo @ để tool ngoài đọc chung. */
+type PromptLogKind = 'info' | 'ok' | 'err';
+
+const promptNoteKind = (msg: string): PromptLogKind => {
+    if (/❌|⚠️|🧩|\[LỖI\]|⏹|tách đôi|không có prompt|thiếu prompt|json hỏng|parse fail|lệch|lỗi/i.test(msg)) return 'err';
+    if (/✅|✨/.test(msg)) return 'ok';
+    return 'info';
+};
+
+/** Nhãn ngắn cho lý do tách lô. Dòng log vẫn kèm nguyên văn `reason`. */
+const splitReasonLabel = (reason: string): string => {
+    const r = reason.toLowerCase();
+    if (/trả\s+\d+\s*\/\s*\d+/.test(r) || r.includes('lệch số') || r.includes('prompt rỗng') || r.includes('thiếu prompt')) return 'lệch số';
+    if (/unexpected end|unterminated|end of json|cụt|truncated/.test(r)) return 'JSON cụt';
+    if (/json|unexpected token|expected |parse|syntax|modeljson/.test(r)) return 'parse fail';
+    return 'lỗi API';
+};
+
 const buildTaoHinhSheets = (chars: EdoCharacter[]) => ({
     taoHinhRows: chars.flatMap(c => c.giaiDoan.map(g => ({
         'Mã @': g.ma ? `@${g.ma}` : '(không cần vẽ)',
@@ -279,6 +302,24 @@ const App: React.FC = () => {
     const [isLoading, setIsLoading] = useState<boolean>(false);
     const [error, setError] = useState<string | null>(null);
     const [status, setStatus] = useState<string>('');
+    // Nhật ký tab Prompts 1 — không xóa khi một lô fail hay khi status bar tự tắt.
+    const [promptLogs, setPromptLogs] = useState<{ t: string; msg: string; kind: PromptLogKind }[]>([]);
+    const promptLogBoxRef = useRef<HTMLDivElement | null>(null);
+    const promptLog = useCallback((msg: string, kind?: PromptLogKind) => {
+        setPromptLogs(prev => [...prev.slice(-399), {
+            t: new Date().toLocaleTimeString('vi-VN', { hour12: false }),
+            msg,
+            kind: kind ?? promptNoteKind(msg),
+        }]);
+    }, []);
+    const logStatus = useCallback((msg: string, kind?: PromptLogKind) => {
+        setStatus(msg);
+        promptLog(msg, kind);
+    }, [promptLog]);
+    useEffect(() => {
+        const el = promptLogBoxRef.current;
+        if (el) el.scrollTop = el.scrollHeight;
+    }, [promptLogs]);
     // Đã bấm chạy cho file hiện tại chưa — nút "Thử lại" CHỈ hiện sau khi đã chạy xong
     // mà vẫn còn dòng lỗi (file mới nạp toàn dòng trống, không phải "lỗi").
     const [hasRunPrompts, setHasRunPrompts] = useState<boolean>(false);
@@ -782,7 +823,10 @@ const App: React.FC = () => {
                             return;
                         }
                     }
-                } catch { /* backup hỏng → coi như file mới, parse lại bên dưới */ }
+                } catch (e) {
+                    const em = e instanceof Error ? e.message : String(e);
+                    promptLog(`⚠️ Backup kết quả hỏng, đọc lại file. ${em}`, 'err');
+                }
             }
 
             // FILE MỚI thật sự → reset bảng như cũ (bài trước đã tự xuất Excel khi chạy xong)
@@ -817,8 +861,10 @@ const App: React.FC = () => {
                 setResults(initialResults);
                 setError(null);
             } catch (e) {
+                const em = e instanceof Error ? e.message : String(e);
                 console.error(e);
-                setError("Lỗi khi đọc file. Vui lòng kiểm tra định dạng.");
+                setError(`Lỗi khi đọc file: ${em}`);
+                promptLog(`❌ Lỗi khi đọc file: ${em}`, 'err');
             }
         };
         if (files.length > 0) {
@@ -943,14 +989,18 @@ const App: React.FC = () => {
 
     const handleAnalyzeCharacters = useCallback(async () => {
         if (rawSubtitles.length === 0) {
-            setError('Vui lòng tải lên nội dung kịch bản ở bước 3 trước.');
+            const line = 'Vui lòng tải lên nội dung kịch bản ở bước 3 trước.';
+            setError(line);
+            promptLog(`⚠️ ${line}`, 'err');
             return;
         }
         try {
             // API trực tiếp (tab Tạo Prompts) là đường đi riêng — không cần cổng/Vertex
             if (!isDirectApiModel(promptTextModel)) ensureVertexConfigured();
         } catch (e) {
-            setError(e instanceof Error ? e.message : String(e));
+            const em = e instanceof Error ? e.message : String(e);
+            setError(em);
+            promptLog(`❌ ${em}`, 'err');
             return;
         }
 
@@ -958,27 +1008,44 @@ const App: React.FC = () => {
         setError(null);
         const controller = new AbortController();
         promptAbortRef.current = controller;
-        setStatus('🤖 Đang đọc kịch bản để phân tích nhân vật...');
+        logStatus('🤖 Đang đọc kịch bản để phân tích nhân vật...', 'info');
 
         try {
-            // Cơ chế @ giai đoạn (tab 4. Edo @): tách nhân vật + faceDNA + prompt tạo hình.
-            const chars = await analyzeEdoCharacters({ items: rawSubtitles, model: promptTextModel, signal: controller.signal });
-            const soAnh = chars.reduce((s, c) => s + c.giaiDoan.filter(g => !!g.ma).length, 0);
-            setStatus(`🎭 Viết prompt tạo hình cho ${soAnh} giai đoạn...`);
-            const withSheets = await generateEdoCharacterSheets({
-                characters: chars, model: promptTextModel,
-                charStyle: imageCharStyle, customInstructions: '', signal: controller.signal,
+            const cast = await resolveImageTabCast({
+                items: rawSubtitles,
+                model: promptTextModel,
+                charStyle: imageCharStyle,
+                signal: controller.signal,
+                onStatus: (message) => logStatus(message),
+                onNote: (message) => promptLog(message),
             });
-            setEdoChars(withSheets);
-            setCharacters(edoToProfiles(withSheets));
-
-            setStatus(`✅ Khóa ${withSheets.length} nhân vật (${soAnh} ảnh tạo hình).`);
+            if (cast.usage) addUsage(cast.usage, 0);
+            setEdoChars(cast.characters);
+            setCharacters(edoToProfiles(cast.characters));
+            const soAnh = cast.characters.reduce((s, c) => s + c.giaiDoan.filter(g => !!g.ma).length, 0);
+            const thieu = cast.missingMa.length
+                ? ` Thiếu prompt tạo hình: ${cast.missingMa.slice(0, 8).join(', ')}${cast.missingMa.length > 8 ? '…' : ''}.`
+                : '';
+            if (cast.missingMa.length) {
+                promptLog(`[LỖI] Thiếu prompt tạo hình (${cast.missingMa.length}): ${cast.missingMa.join(', ')}`, 'err');
+            }
+            if (!cast.characters.length) {
+                logStatus(`⚠️ Không tìm thấy nhân vật. ${cast.warning || ''}`.trim(), 'err');
+            } else if (cast.usedLegacy) {
+                logStatus(`⚠️ Đã dùng phân tích cũ (không đủ giai đoạn Edo) và vẫn viết sheet. ${cast.characters.length} nhân vật, ${soAnh} mã.${thieu}`, 'err');
+            } else if (cast.missingMa.length) {
+                logStatus(`⚠️ Khóa ${cast.characters.length} nhân vật (${soAnh} mã).${thieu}`, 'err');
+            } else {
+                logStatus(`✅ Khóa ${cast.characters.length} nhân vật (${soAnh} ảnh tạo hình).`, 'ok');
+            }
         } catch (e) {
             if (isStopError(e) || controller.signal.aborted) {
-                setStatus('⏹ Đã dừng phân tích nhân vật.');
+                logStatus('⏹ Đã dừng phân tích nhân vật.', 'err');
             } else {
+                const em = e instanceof Error ? e.message : 'Không xác định';
                 console.warn("Analysis failed:", e);
-                setError(`Lỗi phân tích: ${e instanceof Error ? e.message : 'Không xác định'}`);
+                setError(`Lỗi phân tích: ${em}`);
+                logStatus(`❌ Lỗi phân tích: ${em}`, 'err');
             }
         } finally {
             promptAbortRef.current = null;
@@ -987,7 +1054,7 @@ const App: React.FC = () => {
                 setStatus((prev) => prev.includes('✅') ? '' : prev);
             }, 3000);
         }
-    }, [rawSubtitles, apiProvider, vertexStatus, promptTextModel, imageCharStyle]);
+    }, [rawSubtitles, apiProvider, vertexStatus, promptTextModel, imageCharStyle, addUsage, promptLog, logStatus]);
 
 
     // --- TRANSFER CHARACTERS TO SEPARATE CHARACTER GEN PANEL ---
@@ -1005,10 +1072,13 @@ const App: React.FC = () => {
                     characterName: g.ma,
                     aspectRatio: '9:16' as const,
                 }));
-            if (!charJobs.length) return;
+            if (!charJobs.length) {
+                promptLog('⚠️ Không có prompt tạo hình nào để chuyển — các giai đoạn đang trống.', 'err');
+                return;
+            }
             setCharacterJobs(prev => [...prev, ...charJobs]);
             setActiveTab('image');
-            setStatus(`🚀 Đã thêm ${charJobs.length} ảnh tạo hình (theo giai đoạn @) vào Bảng tạo hình.`);
+            logStatus(`🚀 Đã thêm ${charJobs.length} ảnh tạo hình (theo giai đoạn @) vào Bảng tạo hình.`, 'ok');
             setTimeout(() => setStatus(''), 3000);
             return;
         }
@@ -1026,14 +1096,16 @@ const App: React.FC = () => {
         }));
         setCharacterJobs(prev => [...prev, ...charJobs]);
         setActiveTab('image');
-        setStatus(`🚀 Đã thêm ${charJobs.length} nhân vật vào Bảng tạo hình.`);
+        logStatus(`🚀 Đã thêm ${charJobs.length} nhân vật vào Bảng tạo hình.`, 'ok');
         setTimeout(() => setStatus(''), 3000);
-    }, [characters, edoChars]);
+    }, [characters, edoChars, promptLog, logStatus]);
 
 
     const handleGenerate = useCallback(async () => {
         if (files.length === 0) {
-            setError('Không có tệp nào để xử lý.');
+            const line = 'Không có tệp nào để xử lý.';
+            setError(line);
+            promptLog(`⚠️ ${line}`, 'err');
             return;
         }
 
@@ -1043,6 +1115,7 @@ const App: React.FC = () => {
         const controller = new AbortController();
         promptAbortRef.current = controller;
         const signal = controller.signal;
+        logStatus(`🚀 Bắt đầu tạo prompts — ${files.length} file.`, 'info');
 
         try {
             let allFinalExportData: PromptResult[] = [];
@@ -1053,7 +1126,7 @@ const App: React.FC = () => {
                 if (signal.aborted) break;
                 const file = files[fileIdx];
                 try {
-                setStatus(`[File ${fileIdx + 1}/${files.length}] Đang đọc kịch bản: ${file.name}...`);
+                logStatus(`[File ${fileIdx + 1}/${files.length}] Đang đọc kịch bản: ${file.name}...`, 'info');
 
                 // --- 0. PREPARE DATA ---
                 // CÙNG FILE + bảng đã có prompt → tiếp tục trên bảng hiện tại, KHÔNG
@@ -1063,7 +1136,7 @@ const App: React.FC = () => {
                 const canResumeFromTable =
                     fileKey === resultsFileKey &&
                     results.length > 0 &&
-                    results.some(r => r.prompt && r.prompt.trim());
+                    results.some(r => isUsableImagePrompt(r.prompt));
 
                 let fileItems: SubtitleItem[];
                 if (canResumeFromTable) {
@@ -1074,7 +1147,7 @@ const App: React.FC = () => {
                         startTime: 0,
                         endTime: 0,
                     }));
-                    setStatus(`▶️ Cùng file ${file.name} — tiếp tục trên bảng kết quả, chỉ chạy dòng trống...`);
+                    logStatus(`▶️ Cùng file ${file.name} — tiếp tục trên bảng kết quả, chỉ chạy dòng trống...`, 'info');
                 } else {
                     const text = await file.text();
                     fileItems = parseFile(file.name, text);
@@ -1082,15 +1155,16 @@ const App: React.FC = () => {
                     const hasTime = fileItems.some(i => i.endTime > i.startTime);
                     if (hasTime && useAiSceneGrouping) {
                         try {
-                            setStatus(`[File ${fileIdx + 1}/${files.length}] AI đang gom ngữ cảnh SRT...`);
+                            logStatus(`[File ${fileIdx + 1}/${files.length}] AI đang gom ngữ cảnh SRT...`, 'info');
                             const grouped = await groupSubtitlesWithAi(fileItems, signal);
                             addUsage(grouped.usage, 0);
                             fileItems = grouped.items;
-                            setStatus(`AI đã gom còn ${fileItems.length} cảnh, giữ mốc SRT gốc và giới hạn <=25s/cảnh.`);
+                            logStatus(`AI đã gom còn ${fileItems.length} cảnh, giữ mốc SRT gốc và giới hạn <=25s/cảnh.`, 'ok');
                         } catch (e) {
                             if (isStopError(e) || signal.aborted) throw e; // Dừng → thoát hẳn
+                            const em = e instanceof Error ? e.message : String(e);
                             console.warn(`[File ${file.name}] AI scene grouping failed, fallback algorithm:`, e);
-                            setStatus('AI gom ngữ cảnh lỗi, chuyển sang thuật toán gộp hiện tại...');
+                            logStatus(`AI gom ngữ cảnh lỗi (${em}) — chuyển sang thuật toán gộp hiện tại...`, 'err');
                             fileItems = mergeSubtitlesIntoScenes(fileItems);
                         }
                     } else if (useAutoSplit) {
@@ -1105,7 +1179,7 @@ const App: React.FC = () => {
                 // Chạy lại chỉ chạy bù những dòng còn trống.
                 const reuseMap = new Map<string, string>();
                 results.forEach(r => {
-                    if (r.prompt && r.prompt.trim()) reuseMap.set(`${r.id}|${r.subtitle}`, r.prompt);
+                    if (isUsableImagePrompt(r.prompt)) reuseMap.set(`${r.id}|${r.subtitle}`, r.prompt);
                 });
                 setResults(fileItems.map(item => ({
                     id: item.id,
@@ -1116,206 +1190,138 @@ const App: React.FC = () => {
                 const pendingItems = fileItems.filter(item => !reuseMap.get(`${item.id}|${item.text}`));
                 const reusedCount = fileItems.length - pendingItems.length;
                 if (reusedCount > 0) {
-                    setStatus(`♻️ Giữ lại ${reusedCount} prompt đã tạo, chỉ chạy bù ${pendingItems.length} dòng trống...`);
+                    logStatus(`♻️ Giữ lại ${reusedCount} prompt đã tạo, chỉ chạy bù ${pendingItems.length} dòng trống...`, 'info');
                 }
                 await new Promise(r => setTimeout(r, 800));
 
                 // --- 1. AUTO DETECT CHARACTERS --- (bỏ qua nếu không còn dòng nào cần tạo)
-                // ĐÚNG CÔNG THỨC tab 4. Edo @ (Prompts Veo3): nhân vật tách theo GIAI ĐOẠN
-                // + faceDNA + prompt tạo hình. Mỗi bước lỗi được THỬ LẠI 1 lần trước khi
-                // rơi về phân tích cũ — và khi rơi thì báo rõ (Excel sẽ thiếu sheet Tạo hình).
+                // Edo đọc cả kịch bản và tự tách lô khi JSON hỏng. Chỉ khi fail hết mới
+                // dùng phân tích cũ — và lần đó vẫn cố sheet tạo hình, có báo trên status.
                 let activeCharacters: CharacterProfile[] = [];
                 let activeEdoChars: EdoCharacter[] = [];
                 if (pendingItems.length > 0) {
-                    setStatus(`[File ${fileIdx + 1}/${files.length}] 🧑‍🎨 Tách nhân vật & chốt giai đoạn...`);
-                    const analyzeEdo = () => analyzeEdoCharacters({ items: fileItems, model: promptTextModel, signal });
-                    let chars: EdoCharacter[] | null = null;
                     try {
-                        try {
-                            chars = await analyzeEdo();
-                        } catch (e1) {
-                            if (isStopError(e1) || signal.aborted) throw e1;
-                            setStatus(`⚠️ Phân tích giai đoạn lỗi — thử lại lần 2...`);
-                            chars = await analyzeEdo();
+                        const fileTag = `[File ${fileIdx + 1}/${files.length}]`;
+                        const cast = await resolveImageTabCast({
+                            items: fileItems,
+                            model: promptTextModel,
+                            charStyle: imageCharStyle,
+                            signal,
+                            onStatus: (message) => logStatus(`${fileTag} ${message}`),
+                            onNote: (message) => promptLog(`${fileTag} ${message}`),
+                        });
+                        if (cast.usage) addUsage(cast.usage, 0);
+                        activeEdoChars = cast.characters;
+                        if (activeEdoChars.length) {
+                            const profiles = edoToProfiles(activeEdoChars);
+                            activeCharacters = profiles;
+                            setEdoChars(activeEdoChars);
+                            setCharacters(profiles);
+                            const soAnh = activeEdoChars.reduce((s, c) => s + c.giaiDoan.filter(g => !!g.ma).length, 0);
+                            const thieu = cast.missingMa.length
+                                ? ` Thiếu prompt tạo hình: ${cast.missingMa.slice(0, 8).join(', ')}${cast.missingMa.length > 8 ? '…' : ''}.`
+                                : '';
+                            if (cast.missingMa.length) {
+                                promptLog(`${fileTag} [LỖI] Thiếu prompt tạo hình (${cast.missingMa.length}): ${cast.missingMa.join(', ')}`, 'err');
+                            }
+                            if (cast.usedLegacy) {
+                                logStatus(`⚠️ ${fileTag} Đã dùng phân tích cũ (không đủ giai đoạn Edo) và vẫn viết sheet. ${activeEdoChars.length} nhân vật, ${soAnh} mã.${thieu}`, 'err');
+                            } else if (cast.missingMa.length) {
+                                logStatus(`⚠️ ${fileTag} Khóa ${activeEdoChars.length} nhân vật (${soAnh} mã).${thieu}`, 'err');
+                            } else {
+                                logStatus(`✅ Khóa ${activeEdoChars.length} nhân vật (${soAnh} ảnh tạo hình) trong file ${file.name}.`, 'ok');
+                            }
+                        } else {
+                            logStatus(`⚠️ Không tìm thấy nhân vật trong file ${file.name}${cast.warning ? `: ${cast.warning}` : ''}. Tiếp tục tạo prompt...`, 'err');
                         }
                     } catch (e) {
-                        if (isStopError(e) || signal.aborted) throw e; // Dừng → thoát hẳn
-                        console.warn(`[File ${file.name}] Edo-stage analysis failed 2 lần, fallback phân tích cũ:`, e);
-                        setStatus(`⚠️ Phân tích giai đoạn lỗi 2 lần — dùng phân tích cũ (Excel sẽ KHÔNG có sheet Tạo hình).`);
-                        try {
-                            const fullText = fileItems.map(r => r.text).join('\n');
-                            const response = await analyzeCharacters(fullText, apiProvider, '', promptTextModel, signal);
-                            addUsage(response.usage, 0);
-                            setCharacters(response.data);
-                            activeCharacters = response.data;
-                        } catch (e2) {
-                            if (isStopError(e2) || signal.aborted) throw e2;
-                            console.warn(`[File ${file.name}] Character analysis failed:`, e2);
-                            setStatus(`⚠️ Không tìm thấy nhân vật trong file ${file.name}, tiếp tục tạo prompt...`);
-                        }
-                    }
-                    if (chars) {
-                        const soAnh = chars.reduce((s, c) => s + c.giaiDoan.filter(g => !!g.ma).length, 0);
-                        setStatus(`🎭 [File ${fileIdx + 1}/${files.length}] Viết prompt tạo hình cho ${soAnh} giai đoạn...`);
-                        const lamSheets = () => generateEdoCharacterSheets({
-                            characters: chars!, model: promptTextModel,
-                            charStyle: imageCharStyle, customInstructions: '', signal,
-                        });
-                        try {
-                            try {
-                                activeEdoChars = await lamSheets();
-                            } catch (e1) {
-                                if (isStopError(e1) || signal.aborted) throw e1;
-                                setStatus(`⚠️ Prompt tạo hình lỗi — thử lại lần 2...`);
-                                activeEdoChars = await lamSheets();
-                            }
-                        } catch (e) {
-                            if (isStopError(e) || signal.aborted) throw e;
-                            // Tạo hình lỗi hẳn → VẪN GIỮ giai đoạn + mã @ để prompt ảnh chạy đúng,
-                            // sheet Tạo hình sẽ có mã nhưng trống cột prompt.
-                            console.warn(`[File ${file.name}] generateEdoCharacterSheets failed 2 lần:`, e);
-                            setStatus(`⚠️ Prompt tạo hình lỗi 2 lần — giữ mã @ chạy tiếp, sheet Tạo hình sẽ trống prompt.`);
-                            activeEdoChars = chars;
-                        }
-                        setEdoChars(activeEdoChars);
-                        setCharacters(edoToProfiles(activeEdoChars));
-                        setStatus(`✅ Khóa ${activeEdoChars.length} nhân vật (${soAnh} ảnh tạo hình) trong file ${file.name}.`);
+                        if (isStopError(e) || signal.aborted) throw e;
+                        const em = e instanceof Error ? e.message : String(e);
+                        console.warn(`[File ${file.name}] Character analysis failed:`, e);
+                        logStatus(`❌ [File ${fileIdx + 1}/${files.length}] Phân tích nhân vật lỗi: ${em}. Tiếp tục tạo prompt không khóa nhân vật.`, 'err');
                     }
                 }
 
                 // --- 2. GENERATE PROMPTS --- (chỉ những dòng chưa có prompt)
-                setStatus(`[File ${fileIdx + 1}/${files.length}] 🚀 Đang tạo prompts...`);
-                // Lô theo nhà cung cấp: DeepSeek 10 (lô to cụt JSON), Vilao 50 (mỗi request
-                // cõng ~45K token ngữ cảnh ẩn → lô to mới rẻ), Claude SV1/SV2 25 (lô 50 phải
-                // viết ~10K token một hơi → chậm + dễ trả thiếu dòng), Gemini cổng/Vertex 50 như cũ
-                const CHUNK_SIZE = getDirectApiChunkSize(promptTextModel) ?? 50;
-                // Lô cắt thêm tại MỐC BIẾN ĐỔI nhân vật — cả lô dùng chung một roster mã @
-                // (không có mốc/không nhân vật giai đoạn → y hệt cách chia cũ).
+                // Lô nhỏ hơn 50 để JSON không cụt. DeepSeek vốn 10. Lệch số / JSON hỏng
+                // thì tách đôi tới từng dòng — không bỏ cả lô.
+                const CHUNK_SIZE = imagePromptChunkSize(getDirectApiChunkSize(promptTextModel));
                 const chunks: SubtitleItem[][] = chunkByStage(pendingItems, CHUNK_SIZE, activeEdoChars);
 
-                // Seed sẵn các prompt giữ lại để Excel cuối file có đủ cả cũ lẫn mới
                 let generatedPromptsMap: { [id: number]: string } = {};
                 fileItems.forEach(item => {
                     const kept = reuseMap.get(`${item.id}|${item.text}`);
                     if (kept) generatedPromptsMap[item.id] = kept;
                 });
 
-                // CHẠY SONG SONG như tab Prompts Veo3 (mỗi dòng độc lập, nhân vật đã chốt
-                // 1 lần phát chung → an toàn): SV2/Gemini 4 luồng, SV1/DeepSeek 3 luồng.
                 const PROMPT_CONC = promptTextModel.startsWith('deepseek') ? 3 : 4;
                 let doneChunks = 0;
-                let failedChunks = 0;
+                if (pendingItems.length > 0) {
+                    logStatus(`[File ${fileIdx + 1}/${files.length}] 🚀 Đang tạo prompts (${pendingItems.length} dòng, ${chunks.length} lô, ${CHUNK_SIZE} dòng/lô)...`, 'info');
+                }
 
-                const runChunk = async (chunk: SubtitleItem[], i: number): Promise<void> => {
-                    if (signal.aborted) return;
-                    const onPromptRetry: OnRetryCallback = ({ waitSeconds }) => {
-                        setStatus(`⚠️ Lỗi lô ${i + 1}/${chunks.length} của ${file.name}. Thử lại sau ${waitSeconds}s...`);
-                    };
-                    const chunkLines = chunk.map(it => it.text);
-                    // Roster mã @ đúng giai đoạn của lô này — CODE chọn theo id dòng đầu lô.
-                    const chunkRoster = activeEdoChars.length ? buildImageRoster(activeEdoChars, chunk[0].id) : undefined;
-                    let response;
-                    try {
-                        response = await withRetry(
-                            async () => {
-                                const result = await generatePromptsForLines(chunkLines, apiProvider, activeCharacters, '', customInstructions, promptTextModel, signal, chunkRoster);
-                                // Thiếu/thừa dòng = lỗi → retry ngay (trước đây lặng lẽ bỏ qua cả lô)
-                                if (!result.data || result.data.length !== chunkLines.length) {
-                                    throw new Error(`Model trả về ${result.data?.length || 0}/${chunkLines.length} prompt.`);
-                                }
-                                return result;
+                const writePromptsFor = async (chunk: SubtitleItem[], label: string): Promise<void> => {
+                    if (!chunk.length || signal.aborted) return;
+                    const { prompts, errors } = await recoverPromptBatch(chunk, async (slice) => {
+                        return withTransientRetries(async () => {
+                            const roster = activeEdoChars.length ? buildImageRoster(activeEdoChars, slice[0].id) : undefined;
+                            const r = await generatePromptsForLines(slice.map(s => s.text), apiProvider, activeCharacters, '', customInstructions, promptTextModel, signal, roster);
+                            addUsage(r.usage, Array.isArray(r.data) ? r.data.length : 0);
+                            if (!Array.isArray(r.data)) throw new Error('Phản hồi JSON không có mảng prompt.');
+                            return r.data;
+                        }, {
+                            attempts: 3,
+                            signal,
+                            isAbort: (err) => isStopError(err) || signal.aborted,
+                            onRetry: (attempt, error) => {
+                                const em = error instanceof Error ? error.message : String(error);
+                                logStatus(`⚠️ ${label} lỗi tạm lần ${attempt}: ${em}`, 'err');
                             },
-                            3,
-                            onPromptRetry,
-                            signal
-                        );
-                    } catch (e) {
-                        if (isStopError(e) || signal.aborted) throw e; // Dừng → thoát hẳn
-                        // 1 lô lỗi hẳn sau 3 lần thử → bỏ qua chạy tiếp, không hủy cả file;
-                        // các dòng trống sẽ được vòng TỰ CHẠY BÙ phía dưới xử lý tiếp.
-                        failedChunks++;
-                        console.warn(`[File ${file.name}] Lô ${i + 1}/${chunks.length} lỗi sau 3 lần thử, bỏ qua:`, e);
-                        setStatus(`⚠️ Lô ${i + 1}/${chunks.length} lỗi, bỏ qua — sẽ tự chạy bù cuối lượt.`);
-                        return;
-                    }
-
-                    const chunkPrompts = response.data;
-                    addUsage(response.usage, chunkPrompts.length);
-
-                    // Ghi kết quả lô này vào bảng NGAY (backup tự lưu theo mỗi lần setResults)
-                    chunkPrompts.forEach((promptBody, idx) => {
-                        const resultId = chunk[idx].id;
-                        generatedPromptsMap[resultId] = `${resultId}_${promptBody}, ${styleSuffix}`;
+                        });
+                    }, {
+                        singleAttempts: 2,
+                        isAbort: (err) => isStopError(err) || signal.aborted,
+                        onSplit: (size, reason) => logStatus(`🧩 ${label}: tách đôi lô ${size} dòng vì ${splitReasonLabel(reason)}. ${reason}`, 'err'),
+                        onKeep: (index, prompt) => {
+                            const item = chunk[index];
+                            const full = `${item.id}_${prompt}, ${styleSuffix}`;
+                            generatedPromptsMap[item.id] = full;
+                            setResults(prev => prev.map(row => row.id === item.id ? { ...row, prompt: full } : row));
+                        },
                     });
-                    setResults(prev => prev.map(item => {
-                        if (generatedPromptsMap[item.id]) return { ...item, prompt: generatedPromptsMap[item.id] };
-                        return item;
-                    }));
-                    doneChunks++;
-                    setStatus(`🎨 ${file.name}: xong ${doneChunks + failedChunks}/${chunks.length} lô (song song ${PROMPT_CONC} luồng)...`);
+                    prompts.forEach((prompt, index) => {
+                        if (prompt) return;
+                        const item = chunk[index];
+                        const msg = errors[index] || 'không tạo được prompt';
+                        const marker = formatPromptLineError(item.id, msg);
+                        generatedPromptsMap[item.id] = marker;
+                        console.warn(`[Prompts ảnh] Dòng ${item.id} lỗi sau mọi lần thử: ${msg}`);
+                        promptLog(`[LỖI] dòng ${item.id}: ${msg.replace(/\s+/g, ' ').trim()}`, 'err');
+                        setResults(prev => prev.map(row => row.id === item.id ? { ...row, prompt: marker } : row));
+                    });
                 };
 
                 {
                     let nextChunk = 0;
-                    const workerCount = Math.max(1, Math.min(PROMPT_CONC, chunks.length));
+                    const workerCount = Math.max(1, Math.min(PROMPT_CONC, chunks.length || 1));
                     await Promise.all(Array.from({ length: workerCount }, async () => {
                         while (true) {
                             const idx = nextChunk++;
                             if (idx >= chunks.length || signal.aborted) return;
-                            await runChunk(chunks[idx], idx);
+                            await writePromptsFor(chunks[idx], `Lô ${idx + 1}/${chunks.length} của ${file.name}`);
+                            doneChunks++;
+                            setStatus(`🎨 ${file.name}: xong ${doneChunks}/${chunks.length} lô (tối đa ${PROMPT_CONC} luồng, ${CHUNK_SIZE} dòng/lô)...`);
                         }
                     }));
                 }
 
-                // ── TỰ CHẠY BÙ dòng trống (lô 10, lỗi tách đôi tới từng dòng) TRƯỚC khi xuất
-                // Excel — mục tiêu: chạy hàng loạt xong là 100%, không phải bấm "Thử lại" tay.
-                let missing = pendingItems.filter(it => !generatedPromptsMap[it.id]);
-                if (missing.length > 0 && !signal.aborted) {
-                    setStatus(`🔁 Còn ${missing.length} dòng trống — tự chạy bù trước khi xuất file…`);
-                    const fillChunk = async (items: SubtitleItem[], label: string): Promise<void> => {
-                        if (!items.length || signal.aborted) return;
-                        // Chạy bù cũng dùng roster đúng giai đoạn của dòng đầu nhóm.
-                        const fillRoster = activeEdoChars.length ? buildImageRoster(activeEdoChars, items[0].id) : undefined;
-                        try {
-                            const resp = await withRetry(
-                                async () => {
-                                    const r = await generatePromptsForLines(items.map(x => x.text), apiProvider, activeCharacters, '', customInstructions, promptTextModel, signal, fillRoster);
-                                    if (!r.data || r.data.length !== items.length) {
-                                        throw new Error(`Model trả về ${r.data?.length || 0}/${items.length} prompt.`);
-                                    }
-                                    return r;
-                                },
-                                3,
-                                ({ waitSeconds }) => setStatus(`⚠️ Chạy bù ${label} lỗi — thử lại sau ${waitSeconds}s…`),
-                                signal
-                            );
-                            addUsage(resp.usage, resp.data.length);
-                            resp.data.forEach((p, idx) => {
-                                generatedPromptsMap[items[idx].id] = `${items[idx].id}_${p}, ${styleSuffix}`;
-                            });
-                            setResults(prev => prev.map(row => generatedPromptsMap[row.id] ? { ...row, prompt: generatedPromptsMap[row.id] } : row));
-                        } catch (e) {
-                            if (isStopError(e) || signal.aborted) throw e;
-                            if (items.length > 1) {
-                                const mid = Math.ceil(items.length / 2);
-                                setStatus(`🧩 Chạy bù ${label} vẫn lỗi — tách nhỏ chạy tiếp…`);
-                                await fillChunk(items.slice(0, mid), `${label}.1`);
-                                await fillChunk(items.slice(mid), `${label}.2`);
-                            } else {
-                                console.warn(`[auto-bù] Dòng ${items[0].id} vẫn lỗi sau mọi lần thử:`, e);
-                            }
-                        }
-                    };
-                    const FILL_CHUNK = 10;
-                    // Lô bù cũng không vắt qua mốc biến đổi — mỗi lô một roster đúng giai đoạn.
-                    const fillChunks = chunkByStage(missing, FILL_CHUNK, activeEdoChars);
-                    for (let s = 0; s < fillChunks.length && !signal.aborted; s++) {
-                        await fillChunk(fillChunks[s], `lô ${s + 1}`);
-                    }
-                    missing = pendingItems.filter(it => !generatedPromptsMap[it.id]);
-                    setStatus(missing.length === 0
-                        ? `✅ ${file.name}: đã chạy bù đủ 100% số dòng.`
-                        : `⚠️ ${file.name}: còn ${missing.length} dòng vẫn lỗi sau khi tự chạy bù — bấm "Thử lại" để chạy thêm.`);
+                const missing = pendingItems.filter(it => !isUsableImagePrompt(generatedPromptsMap[it.id]));
+                if (pendingItems.length === 0) {
+                    logStatus(`♻️ ${file.name}: mọi dòng đã có prompt, không gọi lại model.`, 'info');
+                } else {
+                    logStatus(missing.length === 0
+                        ? `✅ ${file.name}: đã có prompt cho đủ ${pendingItems.length} dòng.`
+                        : `⚠️ ${file.name}: còn ${missing.length} dòng lỗi (${missing.slice(0, 12).map(it => it.id).join(', ')}${missing.length > 12 ? '…' : ''}). Bấm "Thử lại" để chạy lại đúng các dòng này.`);
                 }
 
                 // --- AUTO DOWNLOAD EXCEL ON SUCCESS FOR THIS FILE ---
@@ -1342,7 +1348,7 @@ const App: React.FC = () => {
                     const femsg = fileErr instanceof Error ? fileErr.message : String(fileErr);
                     fileErrors.push(`${file.name} (${femsg.slice(0, 80)})`);
                     console.error(`[batch] File ${file.name} lỗi — chuyển sang file kế tiếp:`, fileErr);
-                    setStatus(`❌ [File ${fileIdx + 1}/${files.length}] ${file.name} lỗi — chuyển sang file kế tiếp…`);
+                    logStatus(`❌ [File ${fileIdx + 1}/${files.length}] ${file.name} lỗi: ${femsg}`, 'err');
                 }
             }
 
@@ -1364,7 +1370,7 @@ const App: React.FC = () => {
                 }
             }
 
-            setStatus(signal.aborted
+            logStatus(signal.aborted
                 ? '⏹ Đã dừng theo yêu cầu — prompt tạo xong vẫn giữ trên bảng, bấm "Thử lại" để chạy bù dòng trống.'
                 : fileErrors.length > 0
                     ? `⚠️ Xong ${files.length - fileErrors.length}/${files.length} file. File lỗi: ${fileErrors.join('; ').slice(0, 300)}`
@@ -1372,10 +1378,12 @@ const App: React.FC = () => {
         } catch (e) {
             if (isStopError(e) || signal.aborted) {
                 // Người dùng bấm Dừng — không phải lỗi.
-                setStatus('⏹ Đã dừng theo yêu cầu — prompt tạo xong vẫn giữ trên bảng, bấm "Thử lại" để chạy bù dòng trống.');
+                logStatus('⏹ Đã dừng theo yêu cầu — prompt tạo xong vẫn giữ trên bảng, bấm "Thử lại" để chạy bù dòng trống.', 'err');
             } else {
+                const em = e instanceof Error ? e.message : 'Lỗi không xác định';
                 console.error(e);
-                setError(`Quá trình thất bại: ${e instanceof Error ? e.message : 'Lỗi không xác định'}`);
+                setError(`Quá trình thất bại: ${em}`);
+                logStatus(`❌ Quá trình thất bại: ${em}`, 'err');
             }
         } finally {
             promptAbortRef.current = null;
@@ -1383,13 +1391,13 @@ const App: React.FC = () => {
             setIsLoading(false);
             setTimeout(() => setStatus(''), 8000);
         }
-    }, [files, results, resultsFileKey, styleSuffix, apiProvider, customInstructions, promptTextModel, useAutoSplit, useAiSceneGrouping, currentUser, userTokenUsed, selectedFolder, addUsage, imageCharStyle]);
+    }, [files, results, resultsFileKey, styleSuffix, apiProvider, customInstructions, promptTextModel, useAutoSplit, useAiSceneGrouping, currentUser, userTokenUsed, selectedFolder, addUsage, imageCharStyle, promptLog, logStatus]);
 
     // Dừng HẲN tab Tạo Prompts — hủy ngay request đang bay, không ảnh hưởng tab khác.
     const handleStopGenerate = useCallback(() => {
         promptAbortRef.current?.abort();
-        setStatus('⏹ Đang dừng — hủy request đang chạy…');
-    }, []);
+        logStatus('⏹ Đang dừng — hủy request đang chạy…', 'err');
+    }, [logStatus]);
 
     // Xóa kịch bản cũ: gỡ file đã nạp + bảng kết quả + nhân vật (kể cả backup) để chạy mới từ đầu.
     const handleClearOldScript = useCallback(() => {
@@ -1407,84 +1415,74 @@ const App: React.FC = () => {
             localStorage.removeItem('promptResultsFileKey');
         } catch { /* bỏ qua */ }
         setError(null);
-        setStatus('🧹 Đã xóa kịch bản cũ — nạp file mới để bắt đầu.');
+        logStatus('🧹 Đã xóa kịch bản cũ — nạp file mới để bắt đầu.', 'info');
         setTimeout(() => setStatus(''), 4000);
-    }, [isLoading]);
+    }, [isLoading, logStatus]);
     
     const handleRetry = useCallback(async () => {
-        const failedItems = results.filter(r => !r.prompt || r.prompt.trim() === '');
+        const failedItems = results.filter(r => !isUsableImagePrompt(r.prompt));
         if (failedItems.length === 0) return;
         setIsLoading(true);
         setError(null);
         const controller = new AbortController();
         promptAbortRef.current = controller;
         const signal = controller.signal;
-        setStatus('⏳ Đang đợi 5s trước khi thử lại...');
+        logStatus(`⏳ Thử lại ${failedItems.length} dòng lỗi — đợi 5s...`, 'info');
         await new Promise(resolve => setTimeout(resolve, 5000));
 
         try {
-            const CHUNK_SIZE = 10;
-            // Lô thử lại không vắt qua mốc biến đổi nhân vật (id = STT dòng).
+            const CHUNK_SIZE = imagePromptChunkSize(getDirectApiChunkSize(promptTextModel));
             const chunks: PromptResult[][] = chunkByStage(failedItems, CHUNK_SIZE, edoChars);
 
             let successCount = 0;
-            const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-
-            const retryChunk = async (items: PromptResult[], label: string): Promise<void> => {
-                if (items.length === 0 || signal.aborted) return;
-                const subtitles = items.map(item => item.subtitle);
-                setStatus(`🔄 Đang thử lại ${label} (${items.length} dòng)...`);
-
-                const retryRoster = edoChars.length ? buildImageRoster(edoChars, items[0].id) : undefined;
-                try {
-                    const response = await withRetry(
-                        () => generatePromptsForLines(subtitles, apiProvider, characters, '', customInstructions, promptTextModel, signal, retryRoster),
-                        3,
-                        ({ currentAttempt, maxAttempts, waitSeconds }) => {
-                            setStatus(`⚠️ ${label} lỗi lần ${currentAttempt}/${maxAttempts}. Thử lại sau ${waitSeconds}s...`);
-                        },
-                        signal
-                    );
-                    const chunkPrompts = response.data || [];
-                    if (chunkPrompts.length !== subtitles.length) {
-                        throw new Error(`Model trả về ${chunkPrompts.length}/${subtitles.length} prompt.`);
-                    }
-
-                    addUsage(response.usage, chunkPrompts.length);
-
-                    const generatedPromptsMap: { [id: number]: string } = {};
-                    chunkPrompts.forEach((promptBody, idx) => {
-                        const originalItem = items[idx];
-                        generatedPromptsMap[originalItem.id] = `${originalItem.id}_${promptBody}, ${styleSuffix}`;
-                    });
-                    setResults(prev => prev.map(item => (
-                        generatedPromptsMap[item.id] ? { ...item, prompt: generatedPromptsMap[item.id] } : item
-                    )));
-                    successCount += chunkPrompts.length;
-                } catch (e) {
-                    if (isStopError(e) || signal.aborted) return; // Dừng → không tách nhỏ thử tiếp
-                    const message = e instanceof Error ? e.message : String(e);
-                    console.warn(`[retry prompts] ${label} failed (${items.length} dòng):`, message);
-
-                    if (items.length > 1) {
-                        const mid = Math.ceil(items.length / 2);
-                        setStatus(`🧩 ${label} vẫn lỗi, tách nhỏ để thử tiếp...`);
-                        await sleep(1000);
-                        await retryChunk(items.slice(0, mid), `${label}.1`);
-                        await sleep(1000);
-                        await retryChunk(items.slice(mid), `${label}.2`);
-                    }
-                }
-            };
 
             for (let i = 0; i < chunks.length; i++) {
                 if (signal.aborted) break;
-                await retryChunk(chunks[i], `phần ${i + 1}/${chunks.length}`);
-                if (i < chunks.length - 1) await new Promise(resolve => setTimeout(resolve, 2000));
+                const items = chunks[i];
+                const label = `phần ${i + 1}/${chunks.length}`;
+                logStatus(`🔄 Đang thử lại ${label} (${items.length} dòng)...`, 'info');
+                const { prompts, errors } = await recoverPromptBatch(items, async (slice) => {
+                    return withTransientRetries(async () => {
+                        const roster = edoChars.length ? buildImageRoster(edoChars, slice[0].id) : undefined;
+                        const r = await generatePromptsForLines(slice.map(s => s.subtitle), apiProvider, characters, '', customInstructions, promptTextModel, signal, roster);
+                        addUsage(r.usage, Array.isArray(r.data) ? r.data.length : 0);
+                        if (!Array.isArray(r.data)) throw new Error('Phản hồi JSON không có mảng prompt.');
+                        return r.data;
+                    }, {
+                        attempts: 3,
+                        signal,
+                        isAbort: (err) => isStopError(err) || signal.aborted,
+                        onRetry: (attempt, error) => {
+                            const em = error instanceof Error ? error.message : String(error);
+                            logStatus(`⚠️ ${label} lỗi tạm lần ${attempt}: ${em}`, 'err');
+                        },
+                    });
+                }, {
+                    singleAttempts: 2,
+                    isAbort: (err) => isStopError(err) || signal.aborted,
+                    onSplit: (size, reason) => logStatus(`🧩 ${label}: tách đôi lô ${size} dòng vì ${splitReasonLabel(reason)}. ${reason}`, 'err'),
+                    onKeep: (index, prompt) => {
+                        const original = items[index];
+                        const full = `${original.id}_${prompt}, ${styleSuffix}`;
+                        setResults(prev => prev.map(row => row.id === original.id ? { ...row, prompt: full } : row));
+                    },
+                });
+                prompts.forEach((prompt, index) => {
+                    if (prompt) {
+                        successCount++;
+                        return;
+                    }
+                    const original = items[index];
+                    const msg = errors[index] || 'không tạo được prompt khi thử lại';
+                    const marker = formatPromptLineError(original.id, msg);
+                    console.warn(`[Prompts ảnh] Dòng ${original.id} vẫn lỗi sau thử lại: ${msg}`);
+                    promptLog(`[LỖI] dòng ${original.id}: ${msg.replace(/\s+/g, ' ').trim()}`, 'err');
+                    setResults(prev => prev.map(row => row.id === original.id ? { ...row, prompt: marker } : row));
+                });
             }
 
             const stillFailed = failedItems.length - successCount;
-            setStatus(signal.aborted
+            logStatus(signal.aborted
                 ? `⏹ Đã dừng thử lại — tạo bù được ${successCount} dòng.`
                 : stillFailed > 0
                     ? `⚠️ Đã thử lại xong: tạo được ${successCount}, còn ${stillFailed} dòng chưa chạy được.`
@@ -1492,16 +1490,18 @@ const App: React.FC = () => {
             );
         } catch (e) {
             if (isStopError(e) || signal.aborted) {
-                setStatus('⏹ Đã dừng thử lại theo yêu cầu.');
+                logStatus('⏹ Đã dừng thử lại theo yêu cầu.', 'err');
             } else {
-                setError(e instanceof Error ? e.message : 'Lỗi khi thử lại.');
+                const em = e instanceof Error ? e.message : 'Lỗi khi thử lại.';
+                setError(em);
+                logStatus(`❌ Lỗi khi thử lại: ${em}`, 'err');
             }
         } finally {
             promptAbortRef.current = null;
             setIsLoading(false);
             setTimeout(() => setStatus(''), 5000);
         }
-    }, [results, styleSuffix, apiProvider, characters, edoChars, customInstructions, promptTextModel, addUsage]);
+    }, [results, styleSuffix, apiProvider, characters, edoChars, customInstructions, promptTextModel, addUsage, promptLog, logStatus]);
 
     const handleDownload = async () => {
         if (results.some(r => r.prompt)) {
@@ -1526,23 +1526,34 @@ const App: React.FC = () => {
                             sheets?.taoHinhRows, sheets?.nhanVatRows);
                     }
                 } catch (error) {
+                    const em = error instanceof Error ? error.message : String(error);
                     console.error('Error selecting folder:', error);
-                    setError('Lỗi khi chọn thư mục. Vui lòng thử lại.');
+                    setError(`Lỗi khi xuất Excel: ${em}`);
+                    promptLog(`❌ Lỗi khi xuất Excel: ${em}`, 'err');
                 }
             } else {
                 // Đã có folder hoặc không phải Electron → download bình thường
-                let fileName = 'generated_prompts.xlsx';
-                let inputFileName = '';
-                if (files.length > 0) {
-                    const baseName = files[0].name.replace(/\.[^/.]+$/, "");
-                    fileName = `${baseName}_prompts.xlsx`;
-                    inputFileName = files[0].name;
+                try {
+                    let fileName = 'generated_prompts.xlsx';
+                    let inputFileName = '';
+                    if (files.length > 0) {
+                        const baseName = files[0].name.replace(/\.[^/.]+$/, "");
+                        fileName = `${baseName}_prompts.xlsx`;
+                        inputFileName = files[0].name;
+                    }
+                    await exportToExcel(results, fileName, selectedFolder, inputFileName, [],
+                        sheets?.taoHinhRows, sheets?.nhanVatRows);
+                } catch (error) {
+                    const em = error instanceof Error ? error.message : String(error);
+                    console.error(error);
+                    setError(`Lỗi khi xuất Excel: ${em}`);
+                    promptLog(`❌ Lỗi khi xuất Excel: ${em}`, 'err');
                 }
-                await exportToExcel(results, fileName, selectedFolder, inputFileName, [],
-                    sheets?.taoHinhRows, sheets?.nhanVatRows);
             }
         } else {
-            setError("Chưa có prompt nào được tạo để xuất.");
+            const line = 'Chưa có prompt nào được tạo để xuất.';
+            setError(line);
+            promptLog(`⚠️ ${line}`, 'err');
         }
     };
 
@@ -2006,8 +2017,8 @@ const App: React.FC = () => {
         setTimeout(() => setVeo3Status(''), 3000);
     };
     
-    const failedCount = results.filter(r => !r.prompt || r.prompt.trim() === '').length;
-    const hasPrompts = results.some(r => r.prompt && r.prompt.trim() !== '');
+    const failedCount = results.filter(r => !isUsableImagePrompt(r.prompt)).length;
+    const hasPrompts = results.some(r => isUsableImagePrompt(r.prompt));
     const prompt2FailedCount = prompt2Results.filter(r => !r.prompt || r.prompt.trim() === '').length;
     const prompt2HasPrompts = prompt2Results.some(r => r.prompt && r.prompt.trim() !== '');
     const veo3FailedCount = veo3Results.filter(r => !r.prompt || r.prompt.trim() === '').length;
@@ -2192,8 +2203,48 @@ const App: React.FC = () => {
                             </div>
                         </div>
 
-                        <div className="lg:col-span-2 bg-gray-800 p-6 rounded-xl shadow-lg border border-gray-700 h-[calc(100vh-12rem)] min-h-[500px]">
-                            <ResultsTable results={results} isLoading={isLoading} />
+                        <div className="lg:col-span-2 flex flex-col gap-4">
+                            <div className="bg-gray-800 p-6 rounded-xl shadow-lg border border-gray-700 h-[calc(100vh-12rem)] min-h-[60vh]">
+                                <ResultsTable results={results} isLoading={isLoading} />
+                            </div>
+                            <div className="shrink-0 h-72 rounded-lg border border-slate-800 bg-slate-950/90 flex flex-col overflow-hidden">
+                                <div className="flex items-center justify-between px-4 py-2 border-b border-slate-800 bg-slate-900/60 shrink-0">
+                                    <span className="text-xs font-semibold text-slate-200 uppercase tracking-wide">
+                                        <i className="fa-solid fa-terminal mr-1.5 text-emerald-400"></i>
+                                        Nhật ký trực tiếp
+                                        <span className="ml-2 text-slate-400 normal-case font-normal">({promptLogs.length})</span>
+                                    </span>
+                                    <div className="flex items-center gap-3">
+                                        <button
+                                            onClick={() => navigator.clipboard?.writeText(promptLogs.map(l => `${l.t} ${l.msg}`).join('\n'))}
+                                            disabled={!promptLogs.length}
+                                            title="Copy toàn bộ nhật ký"
+                                            className="text-xs text-slate-300 hover:text-emerald-400 disabled:opacity-40 disabled:cursor-not-allowed"
+                                        >
+                                            <i className="fa-solid fa-copy mr-1"></i>Copy
+                                        </button>
+                                        <button
+                                            onClick={() => setPromptLogs([])}
+                                            disabled={!promptLogs.length}
+                                            title="Xóa nhật ký"
+                                            className="text-xs text-slate-300 hover:text-red-400 disabled:opacity-40 disabled:cursor-not-allowed"
+                                        >
+                                            <i className="fa-solid fa-trash-can mr-1"></i>Xóa
+                                        </button>
+                                    </div>
+                                </div>
+                                <div ref={promptLogBoxRef} className="flex-1 overflow-y-auto px-4 py-2.5 font-mono text-sm leading-relaxed select-text">
+                                    {promptLogs.length === 0 ? (
+                                        <p className="text-slate-300">Nạp file rồi bấm Tạo Prompts. Lỗi giữ ở đây để copy.</p>
+                                    ) : promptLogs.map((l, i) => (
+                                        <div key={i} className={`flex gap-2 break-words ${l.kind === 'err' ? 'text-red-400 font-semibold' : l.kind === 'ok' ? 'text-emerald-400' : 'text-slate-100'}`}>
+                                            <span className="text-slate-400 shrink-0">{l.t}</span>
+                                            <i className={`fa-solid ${l.kind === 'err' ? 'fa-circle-xmark' : l.kind === 'ok' ? 'fa-circle-check' : 'fa-circle-info'} shrink-0 mt-1`}></i>
+                                            <span className="whitespace-pre-wrap">{l.msg}</span>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
                         </div>
                     </main>
                 </div>
